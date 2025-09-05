@@ -1,0 +1,415 @@
+name: Xcode Cloud Build Trigger
+
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  trigger-xcode-build:
+    # Only run on PR comments containing the trigger phrase
+    if: github.event.issue.pull_request && contains(github.event.comment.body, '@buildboy build')
+    
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    
+    permissions:
+      pull-requests: write
+      issues: write
+      statuses: write
+    
+    steps:
+      - name: Check commenter permissions
+        id: check-permissions
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: permissionLevel } = await github.rest.repos.getCollaboratorPermissionLevel({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              username: context.payload.comment.user.login
+            });
+            
+            const hasPermission = ['admin', 'write', 'maintain'].includes(permissionLevel.permission);
+
+            if (!hasPermission) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: '❌ @' + context.payload.comment.user.login + ' does not have permission to trigger builds.'
+              });
+              throw new Error('User does not have permission to trigger builds');
+            }
+            
+            console.log('✅ User has permission to trigger builds');
+            return hasPermission;
+
+      - name: React to comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.reactions.createForIssueComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: context.payload.comment.id,
+              content: 'rocket'
+            });
+
+      - name: Get PR details
+        id: pr-details
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number
+            });
+            
+            console.log(`PR Branch: ${pr.head.ref}`);
+            console.log(`PR SHA: ${pr.head.sha}`);
+            console.log(`PR Title: ${pr.title}`);
+            
+            core.setOutput('branch', pr.head.ref);
+            core.setOutput('sha', pr.head.sha);
+            core.setOutput('pr_number', context.issue.number);
+            core.setOutput('pr_title', pr.title);
+            
+            return pr;
+
+      - name: Generate App Store Connect JWT Token
+        id: asc-auth
+        uses: yuki0n0/action-appstoreconnect-token@v1.0
+        with:
+          issuer id: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          key id: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          key: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY }}
+
+      - name: Get Workflow and Repository Info
+        id: workflow-info
+        env:
+          API_TOKEN: ${{ steps.asc-auth.outputs.token }}
+        run: |
+          set -e
+          
+          WORKFLOW_ID="${{ secrets.XCODE_CLOUD_WORKFLOW_ID }}"
+          
+          echo "📋 Getting workflow details..."
+          
+          # Get workflow with repository information
+          response=$(curl -s -w "\n%{http_code}" -X GET \
+            "https://api.appstoreconnect.apple.com/v1/ciWorkflows/${WORKFLOW_ID}?include=repository,product" \
+            -H "Authorization: Bearer ${API_TOKEN}" \
+            -H "Content-Type: application/json")
+          
+          http_code=$(echo "$response" | tail -n1)
+          response_body=$(echo "$response" | head -n-1)
+          
+          if [ "$http_code" != "200" ]; then
+            echo "❌ Failed to get workflow details. HTTP Status: $http_code"
+            echo "Response:"
+            echo "$response_body" | python3 -m json.tool 2>/dev/null || echo "$response_body"
+            exit 1
+          fi
+          
+          # Extract repository ID
+          REPO_ID=$(echo "$response_body" | python3 -c "import sys, json; data = json.load(sys.stdin); print(data.get('data', {}).get('relationships', {}).get('repository', {}).get('data', {}).get('id', ''))" 2>/dev/null || echo "")
+          
+          if [ -z "$REPO_ID" ] || [ "$REPO_ID" = "null" ]; then
+            echo "❌ Could not find repository ID in workflow"
+            exit 1
+          fi
+          
+          echo "✅ Found repository ID: $REPO_ID"
+          echo "repo_id=${REPO_ID}" >> $GITHUB_OUTPUT
+
+      - name: Find Git Reference for Branch
+        id: find-git-ref
+        env:
+          API_TOKEN: ${{ steps.asc-auth.outputs.token }}
+        run: |
+          set -e
+          
+          REPO_ID="${{ steps.workflow-info.outputs.repo_id }}"
+          BRANCH="${{ steps.pr-details.outputs.branch }}"
+          
+          echo "🔍 Looking for branch: $BRANCH"
+          
+          # Method 1: Try getting specific reference by name filter
+          echo "Attempting method 1: Filter by canonicalName..."
+          
+          CANONICAL_NAME="refs/heads/${BRANCH}"
+          # URL encode the canonical name, preserving all special characters including /
+          # Write to temp file to avoid shell quoting issues
+          echo "$CANONICAL_NAME" > /tmp/canonical_name.txt
+          ENCODED_NAME=$(python3 -c "import urllib.parse; import sys; name = open('/tmp/canonical_name.txt').read().strip(); print(urllib.parse.quote(name, safe=''))")
+          rm -f /tmp/canonical_name.txt
+          
+          # Use -g/--globoff to prevent curl from interpreting [] in query keys
+          response=$(curl -g -s -w "\n%{http_code}" -X GET \
+            "https://api.appstoreconnect.apple.com/v1/scmGitReferences?filter[canonicalName]=${ENCODED_NAME}&filter[repository]=${REPO_ID}" \
+            -H "Authorization: Bearer ${API_TOKEN}" \
+            -H "Content-Type: application/json")
+          
+          http_code=$(echo "$response" | tail -n1)
+          response_body=$(echo "$response" | head -n-1)
+          
+          if [ "$http_code" = "200" ]; then
+            # Check if we have valid JSON and extract ID
+            if echo "$response_body" | python3 -m json.tool >/dev/null 2>&1; then
+              GIT_REF_ID=$(echo "$response_body" | python3 -c "import sys, json; data = json.load(sys.stdin); items = data.get('data', []); print(items[0].get('id', '') if items else '')" 2>/dev/null || echo "")
+              if [ -n "$GIT_REF_ID" ]; then
+                echo "✅ Found git reference using canonicalName filter"
+                echo "Git Reference ID: $GIT_REF_ID"
+                echo "git_ref_id=${GIT_REF_ID}" >> $GITHUB_OUTPUT
+                exit 0
+              fi
+            else
+              echo "Response is not valid JSON, trying next method..."
+            fi
+          fi
+          
+          # Method 2: Get all references from repository and search
+          echo "Attempting method 2: Get all references from repository..."
+          
+          # Use -g/--globoff here as well for consistency (even though this URL has no [])
+          response=$(curl -g -s -w "\n%{http_code}" -X GET \
+            "https://api.appstoreconnect.apple.com/v1/scmRepositories/${REPO_ID}/gitReferences?limit=200" \
+            -H "Authorization: Bearer ${API_TOKEN}" \
+            -H "Content-Type: application/json" 2>/dev/null || echo "CURL_ERROR")
+          
+          if [ "$response" = "CURL_ERROR" ]; then
+            echo "❌ Curl command failed"
+            exit 1
+          fi
+          
+          http_code=$(echo "$response" | tail -n1)
+          response_body=$(echo "$response" | head -n-1)
+          
+          if [ "$http_code" != "200" ]; then
+            echo "❌ Failed to get git references. HTTP Status: $http_code"
+            echo "Response body:"
+            echo "$response_body"
+            exit 1
+          fi
+          
+          # Use Python to parse JSON and find branch
+          cat > /tmp/find_branch.py << 'PYTHON_SCRIPT'
+          import sys, json
+          try:
+              data = json.load(sys.stdin)
+              branch = sys.argv[1]
+              canonical = sys.argv[2]
+              for item in data.get("data", []):
+                  attrs = item.get("attributes", {})
+                  if attrs.get("kind") == "BRANCH":
+                      if attrs.get("name") == branch or attrs.get("canonicalName") == canonical:
+                          print(item.get("id", ""))
+                          break
+          except Exception as e:
+              sys.stderr.write(f"Error parsing JSON: {e}\n")
+              sys.exit(1)
+          PYTHON_SCRIPT
+          
+          GIT_REF_ID=$(echo "$response_body" | python3 /tmp/find_branch.py "$BRANCH" "$CANONICAL_NAME" 2>/dev/null || echo "")
+          rm -f /tmp/find_branch.py
+          
+          if [ -n "$GIT_REF_ID" ]; then
+            echo "✅ Found git reference by searching repository references"
+            echo "Git Reference ID: $GIT_REF_ID"
+            echo "git_ref_id=${GIT_REF_ID}" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          # If still not found, show available branches for debugging
+          echo "❌ Could not find branch: $BRANCH"
+          echo "Available branches (first 10):"
+          
+          cat > /tmp/list_branches.py << 'PYTHON_SCRIPT'
+          import sys, json
+          try:
+              data = json.load(sys.stdin)
+              count = 0
+              for item in data.get("data", []):
+                  attrs = item.get("attributes", {})
+                  if attrs.get("kind") == "BRANCH":
+                      print(f"  - {attrs.get('name')} (ID: {item.get('id')})")
+                      count += 1
+                      if count >= 10:
+                          break
+          except:
+              print("Could not parse branches")
+          PYTHON_SCRIPT
+          
+          echo "$response_body" | python3 /tmp/list_branches.py 2>/dev/null || echo "Could not list branches"
+          rm -f /tmp/list_branches.py
+          
+          exit 1
+
+      - name: Trigger Xcode Cloud Build
+        id: xcode-cloud
+        env:
+          API_TOKEN: ${{ steps.asc-auth.outputs.token }}
+        run: |
+          set -e
+          
+          WORKFLOW_ID="${{ secrets.XCODE_CLOUD_WORKFLOW_ID }}"
+          GIT_REF_ID="${{ steps.find-git-ref.outputs.git_ref_id }}"
+          PR_NUMBER="${{ steps.pr-details.outputs.pr_number }}"
+          PR_TITLE="${{ steps.pr-details.outputs.pr_title }}"
+          TRIGGERED_BY="${{ github.event.comment.user.login }}"
+          
+          echo "🚀 Triggering Xcode Cloud build..."
+          echo "  Workflow: $WORKFLOW_ID"
+          echo "  Git Ref: $GIT_REF_ID"
+          
+          # Create description for the build
+          DESCRIPTION="PR #${PR_NUMBER} - ${PR_TITLE} (by @${TRIGGERED_BY})"
+          
+          # Build request body using Python for safe JSON
+          cat > /tmp/build_request.py << 'PYTHON_SCRIPT'
+          import json, sys
+          workflow_id = sys.argv[1]
+          git_ref_id = sys.argv[2]
+          description = sys.argv[3]
+          
+          body = {
+              'data': {
+                  'type': 'ciBuildRuns',
+                  'relationships': {
+                      'workflow': {
+                          'data': {
+                              'type': 'ciWorkflows',
+                              'id': workflow_id
+                          }
+                      },
+                      'sourceBranchOrTag': {
+                          'data': {
+                              'type': 'scmGitReferences',
+                              'id': git_ref_id
+                          }
+                      }
+                  }
+              }
+          }
+          print(json.dumps(body))
+          PYTHON_SCRIPT
+          
+          request_body=$(python3 /tmp/build_request.py "$WORKFLOW_ID" "$GIT_REF_ID" "$DESCRIPTION")
+          rm -f /tmp/build_request.py
+          
+          # Trigger the build
+          response=$(curl -s -w "\n%{http_code}" -X POST \
+            "https://api.appstoreconnect.apple.com/v1/ciBuildRuns" \
+            -H "Authorization: Bearer ${API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "$request_body")
+          
+          http_code=$(echo "$response" | tail -n1)
+          response_body=$(echo "$response" | head -n-1)
+          
+          if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
+            echo "❌ Failed to trigger build. HTTP Status: $http_code"
+            
+            # Parse error details
+            error_title=$(echo "$response_body" | python3 -c "import sys, json; data = json.load(sys.stdin); errors = data.get('errors', []); print(errors[0].get('title', '') if errors else '')" 2>/dev/null || echo "")
+            error_detail=$(echo "$response_body" | python3 -c "import sys, json; data = json.load(sys.stdin); errors = data.get('errors', []); print(errors[0].get('detail', '') if errors else '')" 2>/dev/null || echo "")
+            
+            [ -n "$error_title" ] && echo "Error: $error_title"
+            [ -n "$error_detail" ] && echo "Details: $error_detail"
+            
+            echo "Full response:"
+            echo "$response_body" | python3 -m json.tool 2>/dev/null || echo "$response_body"
+            
+            # Helpful hints based on status code
+            case "$http_code" in
+              401) echo "💡 Check your API key is valid and not expired" ;;
+              403) echo "💡 Ensure your API key has permission to trigger builds" ;;
+              404) echo "💡 Verify the workflow ID and git reference ID are correct" ;;
+              409) echo "💡 A build might already be running for this commit" ;;
+              422) echo "💡 Check if the branch exists and workflow is properly configured" ;;
+            esac
+            
+            exit 1
+          fi
+          
+          # Parse successful response
+          BUILD_ID=$(echo "$response_body" | python3 -c "import sys, json; data = json.load(sys.stdin); print(data.get('data', {}).get('id', ''))" 2>/dev/null || echo "")
+          BUILD_NUMBER=$(echo "$response_body" | python3 -c "import sys, json; data = json.load(sys.stdin); print(data.get('data', {}).get('attributes', {}).get('number', ''))" 2>/dev/null || echo "")
+          
+          if [ -z "$BUILD_ID" ] || [ "$BUILD_ID" = "null" ]; then
+            echo "⚠️ Build triggered but couldn't extract build ID"
+            echo "$response_body" | python3 -m json.tool 2>/dev/null
+            BUILD_ID="pending"
+            BUILD_NUMBER="pending"
+          fi
+          
+          echo "✅ Xcode Cloud build triggered successfully!"
+          echo "  Build ID: $BUILD_ID"
+          echo "  Build Number: $BUILD_NUMBER"
+          
+          echo "build_id=${BUILD_ID}" >> $GITHUB_OUTPUT
+          echo "build_number=${BUILD_NUMBER}" >> $GITHUB_OUTPUT
+
+      - name: Post status comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const buildId = '${{ steps.xcode-cloud.outputs.build_id }}';
+            const buildNumber = '${{ steps.xcode-cloud.outputs.build_number }}';
+            const appId = '${{ secrets.APP_STORE_CONNECT_APP_ID }}';
+            
+            let ascUrl = 'https://appstoreconnect.apple.com/';
+            if (appId && buildId && buildId !== 'pending') {
+              ascUrl = `https://appstoreconnect.apple.com/apps/${appId}/ci/builds/${buildId}`;
+            } else if (appId) {
+              ascUrl = `https://appstoreconnect.apple.com/apps/${appId}/ci`;
+            }
+            
+            const comment = await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `🚀 **Xcode Cloud Build Triggered!**\n\n` +
+                    `**Build Details:**\n` +
+                    `- Branch: \`${{ steps.pr-details.outputs.branch }}\`\n` +
+                    `- Commit: \`${{ steps.pr-details.outputs.sha }}\`\n` +
+                    `- Build ID: \`${buildId}\`\n` +
+                    `- Build Number: \`${buildNumber}\`\n` +
+                    `- Triggered by: @${{ github.event.comment.user.login }}\n\n` +
+                    `📱 **TestFlight Distribution:**\n` +
+                    `The build will be automatically distributed to your internal testing group when complete.\n\n` +
+                    `**Links:**\n` +
+                    `- [View build in App Store Connect](${ascUrl})\n` +
+                    `- [View workflow run](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})\n\n` +
+                    `_You'll receive a TestFlight notification when the build is ready._`
+            });
+
+      - name: Update PR status check
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const buildId = '${{ steps.xcode-cloud.outputs.build_id }}';
+            const buildNumber = '${{ steps.xcode-cloud.outputs.build_number }}';
+            const appId = '${{ secrets.APP_STORE_CONNECT_APP_ID }}';
+            
+            let targetUrl = 'https://appstoreconnect.apple.com/';
+            if (appId && buildId && buildId !== 'pending') {
+              targetUrl = `https://appstoreconnect.apple.com/apps/${appId}/ci/builds/${buildId}`;
+            } else if (appId) {
+              targetUrl = `https://appstoreconnect.apple.com/apps/${appId}/ci`;
+            }
+            
+            const description = buildNumber && buildNumber !== 'pending' 
+              ? `Build #${buildNumber} queued in Xcode Cloud`
+              : `Build queued in Xcode Cloud`;
+            
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: '${{ steps.pr-details.outputs.sha }}',
+              state: 'pending',
+              context: 'xcode-cloud/build',
+              description: description,
+              target_url: targetUrl
+            });
